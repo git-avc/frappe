@@ -26,8 +26,6 @@ frappe.views.ReportView = class ReportView extends frappe.views.ListView {
 		}
 		this.view = "Report";
 
-		this.link_title_doctype_fields = [];
-
 		const route = frappe.get_route();
 		if (route.length === 4) {
 			this.report_name = route[3];
@@ -146,50 +144,6 @@ frappe.views.ReportView = class ReportView extends frappe.views.ListView {
 		if (!this.group_by) {
 			this.init_chart();
 		}
-
-		this.set_link_title_field_value();
-	}
-
-	set_link_title_field_value() {
-		let rows = this.datatable?.datamanager?.rows;
-		let link_col_indices = this.datatable?.datamanager?.columns
-			?.filter((c) => c.docfield?.fieldtype === "Link")
-			.map((c) => c.colIndex);
-
-		Object.keys(this.link_title_doctype_fields).forEach(async (key) => {
-			let link_title = await this.get_link_title_field_value(
-				this.link_title_doctype_fields[key],
-				key
-			);
-
-			if (link_title === undefined) return;
-
-			// update visible DOM elements and cell tooltip
-			document.querySelectorAll(`a[data-name="${key}"]`).forEach((el) => {
-				if (el.textContent === link_title) return;
-				el.textContent = link_title;
-
-				$(el).closest(".dt-cell__content").attr("title", link_title);
-			});
-
-			if (rows?.length && link_col_indices?.length) {
-				for (let row of rows) {
-					for (let ci of link_col_indices) {
-						let cell = row[ci];
-						if (cell?.content === key && cell.html) {
-							cell.html = null;
-						}
-					}
-				}
-			}
-		});
-	}
-
-	async get_link_title_field_value(doctype, value) {
-		return (
-			frappe.utils.get_link_title(doctype, value) ||
-			(await frappe.utils.fetch_link_title(doctype, value))
-		);
 	}
 
 	set_dirty_state_for_custom_report() {
@@ -866,21 +820,46 @@ frappe.views.ReportView = class ReportView extends frappe.views.ListView {
 	}
 
 	set_fields() {
+		// Map: link fieldname -> title field of the linked doctype, populated
+		// when the linked doctype has `show_title_field_in_link` enabled. Used
+		// to inject the title into the SQL SELECT so the report renders the
+		// title in every cell from the first paint, with no async patching.
+		this.link_field_title_fields = {};
+
 		// default fields
 		["name", "docstatus"].map((f) => this._add_field(f));
 
 		if (this.report_name && this.report_doc.json.fields) {
 			let fields = this.report_doc.json.fields.slice();
 			fields.forEach((f) => this._add_field(f[0], f[1]));
+			this._collect_link_title_fields();
 			return;
 		} else if (this.view_user_settings.fields) {
 			// get from user_settings
 			let fields = this.view_user_settings.fields;
 			fields.forEach((f) => this._add_field(f[0], f[1]));
+			this._collect_link_title_fields();
 			return;
 		}
 
 		this.set_default_fields();
+		this._collect_link_title_fields();
+	}
+
+	_collect_link_title_fields() {
+		const title_map = frappe.boot.link_title_doctype_fields;
+		if (!title_map || !Object.keys(title_map).length) {
+			return;
+		}
+		for (let f of this.fields) {
+			const [fieldname, parent] = f;
+			const df = frappe.meta.docfield_map[parent || this.doctype]?.[fieldname];
+			if (!df || df.fieldtype !== "Link") continue;
+			const title_field = title_map[df.options];
+			if (title_field) {
+				this.link_field_title_fields[fieldname] = title_field;
+			}
+		}
 	}
 
 	set_default_fields() {
@@ -957,6 +936,17 @@ frappe.views.ReportView = class ReportView extends frappe.views.ListView {
 			}
 			return column_name;
 		});
+
+		// For parent-doctype Link fields whose target has `show_title_field_in_link`,
+		// also SELECT the target's title field aliased as `<linkfield>_<titlefield>`,
+		// so the report renders the title in every cell from the first paint
+		// (matches List View, avoids async DOM patching races).
+		if (this.link_field_title_fields) {
+			for (let [link_field, title_field] of Object.entries(this.link_field_title_fields)) {
+				fields.push(`${link_field}.${title_field} as ${link_field}_${title_field}`);
+			}
+		}
+
 		const cdt_name_fields = this.get_unique_cdt_in_view().map(
 			(cdt) => frappe.model.get_full_column_name("name", cdt) + " as " + `'${cdt}:name'`
 		);
@@ -1304,14 +1294,6 @@ frappe.views.ReportView = class ReportView extends frappe.views.ListView {
 				if (Array.isArray(row)) {
 					doc = row.reduce((acc, curr) => {
 						if (!curr.column.docfield) return acc;
-
-						if (
-							curr.column.docfield.fieldtype == "Link" &&
-							frappe.boot.link_title_doctypes.includes(curr.column.docfield.options)
-						) {
-							this.link_title_doctype_fields[curr.content] =
-								curr.column.docfield.options;
-						}
 						acc[curr.column.docfield.fieldname] = curr.content;
 						return acc;
 					}, {});
@@ -1406,6 +1388,16 @@ frappe.views.ReportView = class ReportView extends frappe.views.ListView {
 				}
 			} else if (col.field in d) {
 				let rendered_value = d[col.field];
+				// For parent-doctype Link fields with show_title_field_in_link,
+				// prefer the title that we joined into the SELECT.
+				const title_field = this.link_field_title_fields?.[col.field];
+				if (
+					title_field &&
+					col.docfield.fieldtype === "Link" &&
+					d[`${col.field}_${title_field}`]
+				) {
+					rendered_value = d[`${col.field}_${title_field}`];
+				}
 				if (col.docfield.fieldtype == "Data") {
 					rendered_value = frappe.utils.escape_html(rendered_value);
 				}
