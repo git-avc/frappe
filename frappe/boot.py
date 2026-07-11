@@ -110,6 +110,7 @@ def get_bootinfo():
 	bootinfo.desk_settings = get_desk_settings()
 	bootinfo.app_logo_url = get_app_logo()
 	bootinfo.link_title_doctypes = get_link_title_doctypes()
+	bootinfo.link_title_doctype_fields = get_link_title_doctype_fields()
 	bootinfo.translated_doctypes = get_translated_doctypes()
 	bootinfo.doctype_ptype_map = get_doctype_ptype_map()
 	bootinfo.subscription_conf = add_subscription_conf()
@@ -395,6 +396,69 @@ def get_link_title_doctypes():
 		["doc_type as name"],
 	)
 	return [d.name for d in dts + custom_dts if d]
+
+
+def get_link_title_doctype_fields():
+	"""Return a mapping of ``doctype -> title_field`` for all doctypes with
+	``show_title_field_in_link`` enabled.
+
+	Companion to :func:`get_link_title_doctypes` that gives the client the
+	title field for each link target without having to load the target meta
+	(which may not be in the client's ``docfield_map`` yet). Covers both
+	standard DocType rows and ``Property Setter`` overrides for both the
+	``show_title_field_in_link`` and the ``title_field`` properties.
+	"""
+	# 1) Doctypes with show_title_field_in_link=1 set on the DocType row itself.
+	title_doctypes = frappe.get_all(
+		"DocType",
+		{"show_title_field_in_link": 1},
+		["name", "title_field"],
+	)
+
+	# 2) Doctypes where the show_title_field_in_link flag is set via a
+	#    Property Setter (e.g. for built-in doctypes like User that don't
+	#    ship with the flag enabled). The title_field can come from either
+	#    the DocType row or its own Property Setter override.
+	custom_show_dts = frappe.get_all(
+		"Property Setter",
+		{"property": "show_title_field_in_link", "value": "1"},
+		["doc_type as name"],
+	)
+	custom_title_dts = frappe.get_all(
+		"Property Setter",
+		{"property": "title_field"},
+		["doc_type as name", "value as title_field"],
+	)
+	custom_title_map = {d["name"]: d["title_field"] for d in custom_title_dts if d.get("name")}
+
+	# Merge: standard doctypes with their own title_field, then any
+	# custom-show doctypes (use DocType.title_field first, fall back to
+	# the Property Setter override, then skip if neither is set).
+	fields_map: dict[str, str] = {}
+	for d in title_doctypes:
+		if d and d.get("name") and d.get("title_field"):
+			fields_map[d["name"]] = d["title_field"]
+
+	for d in custom_show_dts:
+		if not d or not d.get("name"):
+			continue
+		name = d["name"]
+		if name in fields_map:
+			continue
+		# Look up the title_field: try the DocType row first, then a PS override.
+		title_field = frappe.db.get_value("DocType", name, "title_field")
+		if not title_field:
+			title_field = custom_title_map.get(name)
+		if title_field:
+			fields_map[name] = title_field
+
+	# Also pick up any Property Setter override of title_field for the standard
+	# show-title-link doctypes, since a site may have overridden the field.
+	for name, tf in custom_title_map.items():
+		if name in {d["name"] for d in title_doctypes if d}:
+			fields_map[name] = tf
+
+	return fields_map
 
 
 def set_time_zone(bootinfo):
