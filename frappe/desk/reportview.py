@@ -466,7 +466,17 @@ def _export_query(form_params, csv_params, populate_response=True):
 	if add_totals_row:
 		ret = append_totals_row(ret)
 
-	fields_info = get_field_info(db_query.fields, doctype)
+	# Strip title-alias fields from db_query.fields AND data BEFORE get_field_info
+	# and handle_duration_fieldtype_values, since those functions iterate fields
+	# positionally and call parse_field on each — which breaks on the
+	# ``<linkfield>.<titlefield> as <alias>`` form injected by the report view.
+	db_query_fields, ret = _strip_title_aliases(db_query.fields, ret)
+
+	fields_info = get_field_info(db_query_fields, doctype)
+
+	# Replace link values with their title for columns whose target doctype has
+	# `show_title_field_in_link` enabled, mirroring the on-screen report view.
+	ret = replace_link_values_with_titles(ret, db_query_fields)
 
 	labels = [info["label"] for info in fields_info]
 	sr_label = _("Sr")
@@ -485,7 +495,7 @@ def _export_query(form_params, csv_params, populate_response=True):
 			processed_data.append(processed_row)
 		data.extend(processed_data)
 
-	data = handle_duration_fieldtype_values(doctype, data, db_query.fields)
+	data = handle_duration_fieldtype_values(doctype, data, db_query_fields)
 
 	if file_format_type == "CSV":
 		file_extension = "csv"
@@ -536,6 +546,104 @@ def append_totals_row(data):
 	data.append(totals)
 
 	return data
+
+
+def replace_link_values_with_titles(data, fields):
+	"""Replace Link column values (docnames) with their title for export.
+
+	Mirrors the report view behaviour where columns pointing at a doctype with
+	``show_title_field_in_link`` enabled display the title instead of the name.
+	Permissions are respected: titles for documents the user cannot read fall
+	back to the docname.
+
+	:param data: list of row tuples/lists as returned by ``DatabaseQuery``
+		(may include an injected trailing ``owner`` column and a totals row).
+	:param fields: per-column field strings as used in the SELECT (does not
+		include title aliases — those are stripped by
+		``_strip_title_aliases`` before this function is called).
+	"""
+	from frappe.desk.search import get_link_titles_map
+
+	if not data or not fields:
+		return data
+
+	# Identify Link columns whose target doctype shows the title field.
+	link_columns: dict[int, str] = {}
+	for col_idx, field in enumerate(fields):
+		# parse_field raises on aggregates; for our purposes we only need
+		# to know the parent doctype + fieldname.
+		try:
+			dt, fieldname = parse_field(field)
+		except ValueError:
+			continue
+		if not fieldname:
+			continue
+		doctype = dt or (frappe.local.form_dict.get("doctype") if hasattr(frappe, "local") else None)
+		if not doctype:
+			continue
+		try:
+			meta = frappe.get_meta(doctype)
+		except Exception:
+			continue
+		df = meta.get_field(fieldname)
+		if not df or df.fieldtype != "Link" or not df.options:
+			continue
+		try:
+			link_meta = frappe.get_meta(df.options)
+		except Exception:
+			continue
+		if link_meta.show_title_field_in_link and link_meta.title_field:
+			link_columns[col_idx] = df.options
+
+	if not link_columns:
+		return data
+
+	# Collect docnames per doctype across all rows for a single batched resolve.
+	links: dict[str, list[str]] = {}
+	for row in data:
+		for col_idx, target_doctype in link_columns.items():
+			if col_idx < len(row):
+				value = row[col_idx]
+				if value:
+					links.setdefault(target_doctype, []).append(value)
+
+	titles = get_link_titles_map(links, respect_permissions=True)
+	if not titles:
+		return data
+
+	# Rewrite each cell, falling back to the original value when no title exists.
+	rewritten = []
+	for row in data:
+		row = list(row)
+		for col_idx, target_doctype in link_columns.items():
+			if col_idx < len(row):
+				value = row[col_idx]
+				if value:
+					row[col_idx] = titles.get(f"{target_doctype}::{value}", value)
+		rewritten.append(row)
+
+	return rewritten
+
+
+def _strip_title_aliases(fields, data):
+	"""Remove title-alias columns from ``fields`` and the matching cells from
+	``data`` so downstream positional functions (``get_field_info``,
+	``handle_duration_fieldtype_values``) iterate a clean list.
+
+	Title aliases are detected by the `` as `` separator and the convention
+	``<linkfield>_<titlefield>`` on the right-hand side (e.g.
+	``project.project_name as project_project_name``). They are values
+	injected by the report view to surface the title alongside the docname;
+	they are not real parent fields and break positional parsing downstream.
+	"""
+	if not data or not fields:
+		return fields, data
+	keep_indices = [i for i, f in enumerate(fields) if " as " not in f]
+	if len(keep_indices) == len(fields):
+		return fields, data
+	clean_fields = [fields[i] for i in keep_indices]
+	clean_data = [[row[i] for i in keep_indices if i < len(row)] for row in data]
+	return clean_fields, clean_data
 
 
 def get_field_info(fields, parent_doctype):
