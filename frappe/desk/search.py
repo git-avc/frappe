@@ -492,3 +492,67 @@ def get_link_title(doctype: str, docname: str | int):
 		return frappe.db.get_value(doctype, docname, meta.title_field)
 
 	return docname
+
+
+def get_link_titles_map(links: dict[str, list[str]], respect_permissions: bool = True) -> dict[str, str]:
+	"""Resolve link titles in batch, grouped by doctype.
+
+	:param links: mapping of ``doctype`` -> list of ``docname`` values to resolve.
+	:param respect_permissions: if True, skip titles for docs the user cannot read.
+	:return: mapping of ``"doctype::docname"`` -> resolved title.
+
+	Only doctypes with ``show_title_field_in_link`` enabled produce entries; the
+	caller is expected to fall back to the docname when a key is missing.
+	"""
+	titles: dict[str, str] = {}
+
+	for doctype, docnames in links.items():
+		if not doctype or not docnames:
+			continue
+
+		meta = frappe.get_meta(doctype)
+		if not (meta.show_title_field_in_link and meta.title_field):
+			continue
+
+		# Deduplicate while preserving only truthy names
+		unique_names = list({name for name in docnames if name})
+		if not unique_names:
+			continue
+
+		if respect_permissions and not has_permission(doctype, ptype="read"):
+			# No blanket read access: resolve per-doc so row-level permissions apply.
+			for name in unique_names:
+				if frappe.has_permission(doctype, ptype="read", doc=name):
+					title = frappe.db.get_value(doctype, name, meta.title_field)
+					if title is not None:
+						titles[f"{doctype}::{name}"] = title
+			continue
+
+		rows = frappe.get_all(
+			doctype,
+			filters={"name": ("in", unique_names)},
+			fields=["name", meta.title_field],
+			ignore_permissions=not respect_permissions,
+		)
+		for row in rows:
+			title = row.get(meta.title_field)
+			if title is not None:
+				titles[f"{doctype}::{row['name']}"] = title
+
+	return titles
+
+
+@frappe.whitelist()
+def get_link_titles(links: str | dict) -> dict[str, str]:
+	"""Whitelisted batch resolver used by the report/list views.
+
+	:param links: JSON string (or dict) mapping ``doctype`` -> list of ``docname``.
+	:return: mapping of ``"doctype::docname"`` -> resolved title.
+	"""
+	if isinstance(links, str):
+		links = frappe.parse_json(links)
+
+	if not isinstance(links, dict):
+		frappe.throw(_("Invalid payload for link titles"))
+
+	return get_link_titles_map(links, respect_permissions=True)
