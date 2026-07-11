@@ -1845,6 +1845,37 @@ Object.assign(frappe.utils, {
 		}
 	},
 
+	fetch_link_titles(links) {
+		// Batched title resolver kept for backward compat. The report view now
+		// includes title fields in the SQL SELECT, so this is unused on that
+		// path. Other callers (e.g. formatters) still depend on the per-doc
+		// fetch above.
+		if (!links || $.isEmptyObject(links)) {
+			return Promise.resolve({});
+		}
+		try {
+			return frappe
+				.xcall("frappe.desk.search.get_link_titles", {
+					links: JSON.stringify(links),
+				})
+				.then((titles) => {
+					titles = titles || {};
+					for (let key of Object.keys(titles)) {
+						let sep = key.indexOf("::");
+						if (sep === -1) continue;
+						let dt = key.slice(0, sep);
+						let dn = key.slice(sep + 2);
+						frappe.utils.add_link_title(dt, dn, titles[key]);
+					}
+					return titles;
+				});
+		} catch (error) {
+			console.log("Error while fetching link titles.");
+			console.log(error);
+			return Promise.resolve({});
+		}
+	},
+
 	only_allow_num_decimal(input) {
 		input.on("input", (e) => {
 			let self = $(e.target);
