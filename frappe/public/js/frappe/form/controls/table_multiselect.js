@@ -200,11 +200,17 @@ frappe.ui.form.ControlTableMultiSelect = class ControlTableMultiSelect extends (
 		const pill_name = frappe.utils.get_link_title(link_field.options, value) || value;
 
 		return `
-			<button type="button" class="data-pill btn tb-selected-value" data-value="${encoded_value}">
+			<button type="button" class="data-pill btn tb-selected-value" data-value="${encoded_value}" style="${this.get_pill_style(value)}">
 				<span class="btn-link-to-form">${__(frappe.utils.escape_html(pill_name))}</span>
 				<span class="btn-remove">${frappe.utils.icon("x")}</span>
 			</button>
 		`;
+	}
+	get_pill_style(value) {
+		// deterministic palette color based on the value (same algorithm as
+		// tags and avatars) — keeps the desk visually coherent and themed
+		const [bg, text] = frappe.get_palette(String(value));
+		return `background-color: var(${bg}); color: var(${text});`;
 	}
 	get_options() {
 		return (this.get_link_field() || {}).options;
